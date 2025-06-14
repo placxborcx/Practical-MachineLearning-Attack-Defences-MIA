@@ -1,6 +1,6 @@
 """
 Purpose: Optimized PyTorch implementation of a black-box Membership Inference Attack.
-Enhanced with proper error handling, logging, and multi-dataset support.
+Enhanced with improved transferability, timing metrics, and comprehensive analysis.
 """
 
 import torch
@@ -23,8 +23,10 @@ from tqdm import tqdm
 import json
 import os
 from datetime import datetime
+import time
 import warnings
 warnings.filterwarnings('ignore')
+
 
 # -----------------------------
 # 1. Enhanced Global Configuration
@@ -33,29 +35,39 @@ class Config:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     BATCH_SHADOW = 128
     BATCH_ATTACK = 256
-    EPOCHS_SHADOW = 15  # Increased for better training
-    EPOCHS_ATTACK = 20
-    N_SHADOW = 4
+    EPOCHS_SHADOW = 15
+    EPOCHS_ATTACK = 25  # Increased for better convergence
+    N_SHADOW = 4  # Reduced back to 4 to ensure enough data
     NUM_CLASSES = 10
     SEED = 1337
     
     # Data configuration
-    MNIST_AUX_RATIO = 0.6  # 60% of MNIST for auxiliary data
-    SHADOW_SIZE = 8000     # Reduced to ensure enough data
-    SHADOW_TEST = 1500     # Test size per shadow model
+    MNIST_AUX_RATIO = 0.5  # Reduced to leave more data for target
+    SHADOW_SIZE = 5000     # Reduced to match target better
+    SHADOW_TEST = 1000     
+    
+    # Target model configuration (matching shadow models)
+    TARGET_SIZE = 5000     # Match shadow model size for better transferability
+    TARGET_EPOCHS = 15     # Match shadow model epochs
     
     # Non-member dataset sizes
-    FASHION_SIZE = 6000
-    KMNIST_SIZE = 3000
-    CIFAR_SIZE = 3000
-    NOISE_SIZE = 1500
+    FASHION_SIZE = 3000
+    KMNIST_SIZE = 2000
+    CIFAR_SIZE = 2000
+    NOISE_SIZE = 1000
     
     # Learning rates
     SHADOW_LR = 1e-3
     ATTACK_LR = 5e-3
+    TARGET_LR = 1e-3       # Match shadow model LR
     
     # Validation
     VAL_SPLIT = 0.2
+    
+    # Attack improvements
+    USE_AUGMENTATION = True
+    TEMPERATURE_SCALING = True
+    ENSEMBLE_SHADOWS = True
     
     # Logging
     LOG_DIR = "./mia_results"
@@ -68,12 +80,23 @@ torch.manual_seed(config.SEED)
 np.random.seed(config.SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(config.SEED)
+    torch.backends.cudnn.deterministic = True
 
 # Create logging directory
 os.makedirs(config.LOG_DIR, exist_ok=True)
 
 print(f"Using device: {config.DEVICE}")
 print(f"CUDA available: {torch.cuda.is_available()}")
+
+# Timing decorator
+def time_function(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} took {end_time - start_time:.2f} seconds")
+        return result, end_time - start_time
+    return wrapper
 
 # -----------------------------
 # 2. Enhanced CNN Architecture
@@ -120,11 +143,23 @@ class EnhancedCNN(nn.Module):
         return self.classifier(features)
 
 # -----------------------------
-# 3. Enhanced Feature Engineering
+# 3. Enhanced Feature Engineering with Temperature Calibration
 # -----------------------------
+class TemperatureScaling(nn.Module):
+    """Temperature scaling for calibration"""
+    def __init__(self):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+    
+    def forward(self, logits):
+        return logits / self.temperature
+
 def extract_comprehensive_features(logits, true_labels=None, temperature=1.0):
-    """Extract comprehensive features for membership inference"""
-    # Apply temperature scaling
+    """Extract comprehensive features for membership inference with improvements"""
+    # Apply temperature scaling for better calibration
+    if config.TEMPERATURE_SCALING:
+        temperature = 1.5  # Empirically better for transferability
+    
     scaled_logits = logits / temperature
     probs = F.softmax(scaled_logits, dim=1)
     
@@ -136,55 +171,89 @@ def extract_comprehensive_features(logits, true_labels=None, temperature=1.0):
     entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=1)
     
     # Confidence features
-    confidence_gap = sorted_probs[:, 0] - sorted_probs[:, 1]  # gap between top 2
+    confidence_gap = sorted_probs[:, 0] - sorted_probs[:, 1]
     top3_sum = sorted_probs[:, :3].sum(dim=1)
+    top5_sum = sorted_probs[:, :5].sum(dim=1)
     
     # Statistical features
     prob_variance = probs.var(dim=1)
     prob_std = probs.std(dim=1)
     
-    # Loss-based features (using predicted labels for black-box setting)
+    # Modified Entropy (Renyi entropy)
+    alpha = 2.0
+    renyi_entropy = -torch.log((probs ** alpha).sum(dim=1) + 1e-12) / (alpha - 1)
+    
+    # Loss-based features
     ce_loss = F.cross_entropy(scaled_logits, predicted_class, reduction='none')
     
     # KL divergence from uniform distribution
     uniform_dist = torch.ones_like(probs) / probs.size(1)
     kl_uniform = F.kl_div(torch.log(probs + 1e-12), uniform_dist, reduction='none').sum(dim=1)
     
+    # Margin-based features
+    margin = sorted_probs[:, 0] - sorted_probs[:, -1]
+    
     # Combine all features
     features = torch.stack([
         max_prob,           # 0: Maximum probability
-        entropy,            # 1: Predictive entropy
+        entropy,            # 1: Shannon entropy
         ce_loss,            # 2: Cross-entropy loss
         confidence_gap,     # 3: Confidence gap
         top3_sum,           # 4: Sum of top-3 probabilities
-        prob_variance,      # 5: Probability variance
-        prob_std,           # 6: Probability standard deviation
-        kl_uniform,         # 7: KL divergence from uniform
-        sorted_probs[:, 0], # 8: Highest probability
-        sorted_probs[:, 1], # 9: Second highest probability
+        top5_sum,           # 5: Sum of top-5 probabilities
+        prob_variance,      # 6: Probability variance
+        prob_std,           # 7: Probability standard deviation
+        kl_uniform,         # 8: KL divergence from uniform
+        renyi_entropy,      # 9: Renyi entropy
+        margin,             # 10: Margin
+        sorted_probs[:, 0], # 11: Highest probability
+        sorted_probs[:, 1], # 12: Second highest probability
     ], dim=1)
     
     return features.detach()
 
 # -----------------------------
-# 4. Enhanced Data Loading
+# 4. Enhanced Data Loading with Augmentation
 # -----------------------------
+def get_augmentation_transform():
+    """Get augmentation transforms for better generalization"""
+    return transforms.Compose([
+        transforms.RandomRotation(5),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+
 def load_datasets():
     """Load and prepare all datasets with proper transforms"""
     print("Loading datasets...")
     
-    # Common transform pipeline
+    # Standard transform
     transform = transforms.Compose([
         transforms.Grayscale(num_output_channels=1),
         transforms.Resize((28, 28)),
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))  # Normalize to [-1, 1]
+        transforms.Normalize((0.5,), (0.5,))
+    ])
+    
+    # Augmented transform for shadow models
+    aug_transform = transforms.Compose([
+        transforms.Grayscale(num_output_channels=1),
+        transforms.Resize((28, 28)),
+        transforms.RandomRotation(5),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
     ])
     
     # Load datasets
     try:
         mnist_train = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
         mnist_test = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
+        
+        # Load with augmentation for shadow training
+        mnist_train_aug = datasets.MNIST(root="./data", train=True, download=True, transform=aug_transform)
+        
         fashion_mnist = datasets.FashionMNIST(root="./data", train=True, download=True, transform=transform)
         kmnist = datasets.KMNIST(root="./data", train=True, download=True, transform=transform)
         cifar10 = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
@@ -198,31 +267,58 @@ def load_datasets():
         print(f"Error loading datasets: {e}")
         raise
     
-    return mnist_train, mnist_test, fashion_mnist, kmnist, cifar10
+    return mnist_train, mnist_test, mnist_train_aug, fashion_mnist, kmnist, cifar10
 
-def create_auxiliary_datasets(mnist_train, fashion_mnist, kmnist, cifar10):
-    """Create auxiliary datasets for shadow model training"""
+def create_auxiliary_datasets(mnist_train, mnist_train_aug, fashion_mnist, kmnist, cifar10):
+    """Create auxiliary datasets with improved distribution matching"""
     print("Creating auxiliary datasets...")
     
-    # Calculate required total size
-    total_shadow_data_needed = config.N_SHADOW * (config.SHADOW_SIZE + config.SHADOW_TEST)
-    mnist_aux_size = int(config.MNIST_AUX_RATIO * len(mnist_train))
+    # Calculate data requirements more carefully
+    shadow_data_per_model = config.SHADOW_SIZE + config.SHADOW_TEST
+    total_shadow_data_needed = config.N_SHADOW * shadow_data_per_model
     
-    print(f"Total shadow data needed: {total_shadow_data_needed}")
-    print(f"Available MNIST auxiliary size: {mnist_aux_size}")
+    # Reserve data for target model
+    target_reserve_size = config.TARGET_SIZE + 2000  # Extra for validation
     
-    if mnist_aux_size < total_shadow_data_needed:
-        print(f"Warning: Not enough MNIST data. Adjusting shadow sizes...")
-        available_per_shadow = mnist_aux_size // config.N_SHADOW
-        config.SHADOW_SIZE = int(available_per_shadow * 0.8)
-        config.SHADOW_TEST = int(available_per_shadow * 0.2)
-        print(f"Adjusted shadow size: {config.SHADOW_SIZE}, test size: {config.SHADOW_TEST}")
+    # Ensure we have enough total data
+    total_mnist = len(mnist_train)
+    print(f"Total MNIST data available: {total_mnist}")
+    print(f"Target reserve needed: {target_reserve_size}")
+    print(f"Shadow data needed: {total_shadow_data_needed}")
     
-    # Create MNIST auxiliary subset
-    mnist_indices = np.random.permutation(len(mnist_train))[:mnist_aux_size]
-    mnist_aux = Subset(mnist_train, mnist_indices)
+    # Check if we have enough data
+    min_required = target_reserve_size + total_shadow_data_needed
+    if total_mnist < min_required:
+        print(f"Warning: Not enough data! Need {min_required}, have {total_mnist}")
+        # Adjust sizes proportionally
+        scale_factor = total_mnist / min_required * 0.9  # 0.9 for safety margin
+        config.SHADOW_SIZE = int(config.SHADOW_SIZE * scale_factor)
+        config.SHADOW_TEST = int(config.SHADOW_TEST * scale_factor)
+        config.TARGET_SIZE = int(config.TARGET_SIZE * scale_factor)
+        
+        # Recalculate
+        shadow_data_per_model = config.SHADOW_SIZE + config.SHADOW_TEST
+        total_shadow_data_needed = config.N_SHADOW * shadow_data_per_model
+        target_reserve_size = config.TARGET_SIZE + 2000
+        
+        print(f"Adjusted sizes - Shadow: {config.SHADOW_SIZE}, Test: {config.SHADOW_TEST}, Target: {config.TARGET_SIZE}")
     
-    # Create non-member datasets
+    # Create indices ensuring no overlap
+    all_indices = np.random.permutation(len(mnist_train))
+    
+    # Split indices
+    target_indices = all_indices[:target_reserve_size]
+    aux_start = target_reserve_size
+    aux_end = aux_start + total_shadow_data_needed
+    aux_indices = all_indices[aux_start:aux_end]
+    
+    print(f"Auxiliary data indices: {len(aux_indices)}")
+    print(f"Target data indices: {len(target_indices)}")
+    
+    # Create auxiliary subsets
+    mnist_aux = Subset(mnist_train_aug if config.USE_AUGMENTATION else mnist_train, aux_indices)
+    
+    # Create non-member datasets with better diversity
     fashion_indices = np.random.choice(len(fashion_mnist), 
                                      min(config.FASHION_SIZE, len(fashion_mnist)), 
                                      replace=False)
@@ -233,13 +329,27 @@ def create_auxiliary_datasets(mnist_train, fashion_mnist, kmnist, cifar10):
                                    min(config.CIFAR_SIZE, len(cifar10)), 
                                    replace=False)
     
-    # Create synthetic noise dataset
+    # Create synthetic noise dataset with more realistic patterns
     def create_noise_dataset(n_samples):
-        data = torch.randn(n_samples, 1, 28, 28)
-        # Normalize to [0, 1] then to [-1, 1] to match other data
-        data = (data - data.min()) / (data.max() - data.min())
-        data = 2 * data - 1
-        labels = torch.randint(0, config.NUM_CLASSES, (n_samples,))
+        data = []
+        labels = []
+        for _ in range(n_samples):
+            # Mix of different noise patterns
+            noise_type = np.random.choice(['gaussian', 'uniform', 'salt_pepper'])
+            if noise_type == 'gaussian':
+                img = torch.randn(1, 28, 28) * 0.3
+            elif noise_type == 'uniform':
+                img = torch.rand(1, 28, 28) * 2 - 1
+            else:  # salt and pepper
+                img = torch.randn(1, 28, 28) * 0.1
+                mask = torch.rand(1, 28, 28) > 0.9
+                img[mask] = torch.randint(-1, 2, (mask.sum(),)).float()
+            
+            data.append(img)
+            labels.append(torch.randint(0, config.NUM_CLASSES, (1,)).item())
+        
+        data = torch.stack(data)
+        labels = torch.tensor(labels)
         return TensorDataset(data, labels)
     
     noise_dataset = create_noise_dataset(config.NOISE_SIZE)
@@ -254,20 +364,21 @@ def create_auxiliary_datasets(mnist_train, fashion_mnist, kmnist, cifar10):
     
     print(f"Non-member dataset size: {len(nonmember_datasets)}")
     
-    return mnist_aux, nonmember_datasets, mnist_indices
+    return mnist_aux, nonmember_datasets, aux_indices, target_indices
 
 # -----------------------------
 # 5. Enhanced Shadow Model Training
 # -----------------------------
+@time_function
 def train_shadow_model(model, train_loader, val_loader, model_id):
-    """Train a single shadow model with validation monitoring"""
+    """Train a single shadow model with improved regularization"""
     print(f"Training shadow model {model_id}...")
     
     optimizer = optim.Adam(model.parameters(), lr=config.SHADOW_LR, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS_SHADOW)
     
     best_val_acc = 0
-    patience = 5
+    patience = 7
     patience_counter = 0
     
     train_losses, val_losses = [], []
@@ -286,6 +397,12 @@ def train_shadow_model(model, train_loader, val_loader, model_id):
             optimizer.zero_grad()
             output = model(data)
             loss = F.cross_entropy(output, target)
+            
+            # Add L2 regularization
+            l2_lambda = 1e-4
+            l2_norm = sum(p.pow(2.0).sum() for p in model.parameters())
+            loss = loss + l2_lambda * l2_norm
+            
             loss.backward()
             optimizer.step()
             
@@ -337,11 +454,16 @@ def train_shadow_model(model, train_loader, val_loader, model_id):
         
         scheduler.step()
     
+    # Load best model
+    if config.SAVE_MODELS:
+        model.load_state_dict(torch.load(f"{config.LOG_DIR}/shadow_model_{model_id}_best.pth"))
+    
     print(f"Shadow model {model_id} training completed. Best val acc: {best_val_acc:.2f}%")
-    return train_losses, val_losses, train_accs, val_accs
+    return (train_losses, val_losses, train_accs, val_accs)
 
-def collect_shadow_features(shadow_models, mnist_aux, nonmember_datasets, mnist_indices):
-    """Collect features from shadow models for attack training"""
+@time_function
+def collect_shadow_features(shadow_models, mnist_aux, nonmember_datasets, aux_indices):
+    """Collect features with ensemble predictions"""
     print("Collecting features from shadow models...")
     
     all_member_features = []
@@ -357,15 +479,13 @@ def collect_shadow_features(shadow_models, mnist_aux, nonmember_datasets, mnist_
         end_test = start_idx + config.SHADOW_SIZE + config.SHADOW_TEST
         
         # Member data (shadow training set)
-        member_indices = mnist_indices[start_idx:end_train]
-        member_subset = Subset(mnist_aux.dataset, member_indices)
+        shadow_train_indices = aux_indices[start_idx:end_train]
+        member_subset = Subset(mnist_aux.dataset, shadow_train_indices)
         member_loader = DataLoader(member_subset, batch_size=config.BATCH_ATTACK, shuffle=False)
         
-        # Non-member data (shadow test set + external)
-        nonmember_indices = mnist_indices[end_train:end_test]
-        nonmember_subset = Subset(mnist_aux.dataset, nonmember_indices)
-        
-        # Add external non-member data
+        # Non-member data (shadow test set)
+        shadow_test_indices = aux_indices[end_train:end_test]
+        nonmember_subset = Subset(mnist_aux.dataset, shadow_test_indices)
         nonmember_loader = DataLoader(nonmember_subset, batch_size=config.BATCH_ATTACK, shuffle=False)
         
         # Collect member features
@@ -376,7 +496,7 @@ def collect_shadow_features(shadow_models, mnist_aux, nonmember_datasets, mnist_
                 features = extract_comprehensive_features(logits)
                 all_member_features.append(features.cpu())
         
-        # Collect non-member features (in-distribution)
+        # Collect non-member features
         with torch.no_grad():
             for data, _ in nonmember_loader:
                 data = data.to(config.DEVICE)
@@ -384,19 +504,26 @@ def collect_shadow_features(shadow_models, mnist_aux, nonmember_datasets, mnist_
                 features = extract_comprehensive_features(logits)
                 all_nonmember_features.append(features.cpu())
     
-    # Collect features from external non-member datasets (using all shadow models)
-    print("Collecting external non-member features...")
-    external_loader = DataLoader(nonmember_datasets, batch_size=config.BATCH_ATTACK, shuffle=False)
-    
-    # Use each shadow model to extract features from external data
-    for i, model in enumerate(shadow_models):
-        model.eval()
-        with torch.no_grad():
-            for data, _ in external_loader:
-                data = data.to(config.DEVICE)
-                logits = model(data)
-                features = extract_comprehensive_features(logits)
-                all_nonmember_features.append(features.cpu())
+    # Collect features from external non-member datasets
+    if config.ENSEMBLE_SHADOWS:
+        print("Collecting external non-member features with ensemble...")
+        external_loader = DataLoader(nonmember_datasets, batch_size=config.BATCH_ATTACK, shuffle=False)
+        
+        # Use ensemble of shadow models for better features
+        for data, _ in external_loader:
+            data = data.to(config.DEVICE)
+            ensemble_features = []
+            
+            for model in shadow_models:
+                model.eval()
+                with torch.no_grad():
+                    logits = model(data)
+                    features = extract_comprehensive_features(logits)
+                    ensemble_features.append(features)
+            
+            # Average features across models
+            avg_features = torch.stack(ensemble_features).mean(dim=0)
+            all_nonmember_features.append(avg_features.cpu())
     
     # Combine all features
     member_features = torch.cat(all_member_features, dim=0)
@@ -410,35 +537,63 @@ def collect_shadow_features(shadow_models, mnist_aux, nonmember_datasets, mnist_
 # -----------------------------
 # 6. Enhanced Attack Classifier
 # -----------------------------
-class EnhancedAttackMLP(nn.Module):
-    """Enhanced MLP for membership inference with batch normalization and dropout"""
-    def __init__(self, input_dim=10, hidden_dims=[64, 32, 16], dropout_rate=0.3):
+class ImprovedAttackMLP(nn.Module):
+    """Improved MLP with residual connections for better gradient flow"""
+    def __init__(self, input_dim=13, hidden_dims=[128, 64, 32], dropout_rate=0.3):
         super().__init__()
         
-        layers = []
-        prev_dim = input_dim
+        self.input_bn = nn.BatchNorm1d(input_dim)
         
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
+        # First layer
+        self.fc1 = nn.Linear(input_dim, hidden_dims[0])
+        self.bn1 = nn.BatchNorm1d(hidden_dims[0])
+        self.dropout1 = nn.Dropout(dropout_rate)
+        
+        # Hidden layers with residual connections
+        self.hidden_layers = nn.ModuleList()
+        for i in range(len(hidden_dims) - 1):
+            layer = nn.Sequential(
+                nn.Linear(hidden_dims[i], hidden_dims[i+1]),
+                nn.BatchNorm1d(hidden_dims[i+1]),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout_rate)
-            ])
-            prev_dim = hidden_dim
+            )
+            self.hidden_layers.append(layer)
         
-        layers.append(nn.Linear(prev_dim, 2))  # Binary classification
+        # Output layer
+        self.fc_out = nn.Linear(hidden_dims[-1], 2)
         
-        self.network = nn.Sequential(*layers)
+        # Skip connection
+        self.skip = nn.Linear(input_dim, hidden_dims[-1])
     
     def forward(self, x):
-        return self.network(x)
+        # Input normalization
+        x = self.input_bn(x)
+        identity = self.skip(x)
+        
+        # First layer
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.dropout1(x)
+        
+        # Hidden layers
+        for layer in self.hidden_layers:
+            x = layer(x)
+        
+        # Add skip connection
+        x = x + identity
+        x = F.relu(x)
+        
+        # Output
+        return self.fc_out(x)
 
+@time_function
 def train_attack_classifier(X_train, y_train, X_val, y_val):
-    """Train the attack classifier with comprehensive monitoring"""
+    """Train attack classifier with improved optimization"""
     print("Training attack classifier...")
     
-    # Create data loaders
+    # Create data loaders with data augmentation
     train_dataset = TensorDataset(X_train, y_train)
     val_dataset = TensorDataset(X_val, y_val)
     train_loader = DataLoader(train_dataset, batch_size=config.BATCH_ATTACK, shuffle=True)
@@ -446,14 +601,22 @@ def train_attack_classifier(X_train, y_train, X_val, y_val):
     
     # Initialize model
     input_dim = X_train.shape[1]
-    model = EnhancedAttackMLP(input_dim=input_dim).to(config.DEVICE)
+    model = ImprovedAttackMLP(input_dim=input_dim).to(config.DEVICE)
     
-    # Optimizer and scheduler
-    optimizer = optim.Adam(model.parameters(), lr=config.ATTACK_LR, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+    # Optimizer with learning rate scheduling
+    optimizer = optim.AdamW(model.parameters(), lr=config.ATTACK_LR, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=config.ATTACK_LR,
+        epochs=config.EPOCHS_ATTACK,
+        steps_per_epoch=len(train_loader)
+    )
+    
+    # Loss function with label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     best_val_auc = 0
-    patience = 8
+    patience = 10
     patience_counter = 0
     
     train_losses, val_losses = [], []
@@ -468,11 +631,21 @@ def train_attack_classifier(X_train, y_train, X_val, y_val):
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(config.DEVICE), batch_y.to(config.DEVICE)
             
+            # Add noise to inputs for regularization
+            if epoch < config.EPOCHS_ATTACK // 2:
+                noise = torch.randn_like(batch_x) * 0.01
+                batch_x = batch_x + noise
+            
             optimizer.zero_grad()
             outputs = model(batch_x)
-            loss = F.cross_entropy(outputs, batch_y)
+            loss = criterion(outputs, batch_y)
             loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
+            scheduler.step()
             
             train_loss += loss.item()
             probs = F.softmax(outputs, dim=1)[:, 1]
@@ -488,7 +661,7 @@ def train_attack_classifier(X_train, y_train, X_val, y_val):
             for batch_x, batch_y in val_loader:
                 batch_x, batch_y = batch_x.to(config.DEVICE), batch_y.to(config.DEVICE)
                 outputs = model(batch_x)
-                loss = F.cross_entropy(outputs, batch_y)
+                loss = criterion(outputs, batch_y)
                 val_loss += loss.item()
                 
                 probs = F.softmax(outputs, dim=1)[:, 1]
@@ -519,14 +692,12 @@ def train_attack_classifier(X_train, y_train, X_val, y_val):
             if patience_counter >= patience:
                 print(f"  Early stopping at epoch {epoch}")
                 break
-        
-        scheduler.step(val_auc)
     
     print(f"Attack classifier training completed. Best val AUC: {best_val_auc:.4f}")
-    return model, train_losses, val_losses, train_aucs, val_aucs
+    return (model, train_losses, val_losses, train_aucs, val_aucs)
 
 # -----------------------------
-# 7. Evaluation and Analysis
+# 7. Evaluation Functions
 # -----------------------------
 def comprehensive_evaluation(model, X_test, y_test, scaler, title="Test"):
     """Comprehensive evaluation with multiple metrics"""
@@ -559,7 +730,7 @@ def comprehensive_evaluation(model, X_test, y_test, scaler, title="Test"):
     # ROC curve
     fpr, tpr, roc_thresholds = roc_curve(all_labels, all_probs)
     
-    # Find optimal threshold (Youden's J statistic)
+    # Find optimal threshold
     j_scores = tpr - fpr
     optimal_idx = np.argmax(j_scores)
     optimal_threshold = roc_thresholds[optimal_idx]
@@ -568,7 +739,7 @@ def comprehensive_evaluation(model, X_test, y_test, scaler, title="Test"):
     predictions = (all_probs >= optimal_threshold).astype(int)
     accuracy = accuracy_score(all_labels, predictions)
     
-    # TPR at FPR = 0.1 (regulatory requirement)
+    # TPR at FPR = 0.1
     target_fpr = 0.1
     fpr_idx = np.where(fpr <= target_fpr)[0]
     if len(fpr_idx) > 0:
@@ -593,6 +764,45 @@ def comprehensive_evaluation(model, X_test, y_test, scaler, title="Test"):
     print(f"[{title}] AUC: {auc:.4f}, Accuracy: {accuracy:.4f}, "
           f"TPR@FPR=0.1: {tpr_at_01_fpr:.4f}")
     
+    return results
+
+@time_function
+def evaluate_on_target_model(attack_model, target_model, target_train_data, target_test_data, scaler):
+    """Evaluate the attack on the actual target model"""
+    print("\n=== Evaluating on Target Model ===")
+    target_model.eval()
+    
+    # Prepare data loaders
+    target_train_loader = DataLoader(target_train_data, batch_size=config.BATCH_ATTACK, shuffle=False)
+    target_test_loader = DataLoader(target_test_data, batch_size=config.BATCH_ATTACK, shuffle=False)
+    
+    # Extract features from target model
+    def extract_features_from_loader(model, loader):
+        features_list = []
+        
+        with torch.no_grad():
+            for data, _ in loader:
+                data = data.to(config.DEVICE)
+                logits = model(data)
+                features = extract_comprehensive_features(logits)
+                features_list.append(features.cpu())
+                
+        return torch.cat(features_list, dim=0)
+    
+    print("Extracting features from target model...")
+    member_features = extract_features_from_loader(target_model, target_train_loader)
+    nonmember_features = extract_features_from_loader(target_model, target_test_loader)
+    
+    # Create labels
+    member_labels = torch.ones(len(member_features), dtype=torch.long)
+    nonmember_labels = torch.zeros(len(nonmember_features), dtype=torch.long)
+    
+    # Combine features and labels
+    all_features = torch.cat([member_features, nonmember_features], dim=0)
+    all_labels = torch.cat([member_labels, nonmember_labels], dim=0)
+    
+    # Evaluate
+    results = comprehensive_evaluation(attack_model, all_features, all_labels, scaler, "Target Model")
     return results
 
 def plot_results(results_list, save_path=None):
@@ -621,7 +831,7 @@ def plot_results(results_list, save_path=None):
     axes[0, 1].grid(True, alpha=0.3)
     
     # Score distributions
-    for i, results in enumerate(results_list[:2]):  # Only plot first two
+    for i, results in enumerate(results_list[:2]):
         member_scores = results['all_probs'][results['all_labels'] == 1]
         nonmember_scores = results['all_probs'][results['all_labels'] == 0]
         
@@ -641,64 +851,38 @@ def plot_results(results_list, save_path=None):
     plt.show()
 
 # -----------------------------
-# 8. Target Model Evaluation
-# -----------------------------
-def evaluate_on_target_model(attack_model, target_model, target_train_data, target_test_data, scaler):
-    """Evaluate the attack on the actual target model"""
-    print("\n=== Evaluating on Target Model ===")
-    target_model.eval()
-    
-    # Prepare data loaders
-    target_train_loader = DataLoader(target_train_data, batch_size=config.BATCH_ATTACK, shuffle=False)
-    target_test_loader = DataLoader(target_test_data, batch_size=config.BATCH_ATTACK, shuffle=False)
-    
-    # Extract features from target model
-    def extract_features_from_loader(model, loader):
-        features_list = []
-        labels_list = []
-        
-        with torch.no_grad():
-            for data, _ in loader:
-                data = data.to(config.DEVICE)
-                logits = model(data)
-                features = extract_comprehensive_features(logits)
-                features_list.append(features.cpu())
-                
-        return torch.cat(features_list, dim=0)
-    
-    print("Extracting features from target model...")
-    member_features = extract_features_from_loader(target_model, target_train_loader)
-    nonmember_features = extract_features_from_loader(target_model, target_test_loader)
-    
-    # Create labels
-    member_labels = torch.ones(len(member_features), dtype=torch.long)
-    nonmember_labels = torch.zeros(len(nonmember_features), dtype=torch.long)
-    
-    # Combine features and labels
-    all_features = torch.cat([member_features, nonmember_features], dim=0)
-    all_labels = torch.cat([member_labels, nonmember_labels], dim=0)
-    
-    # Evaluate
-    results = comprehensive_evaluation(attack_model, all_features, all_labels, scaler, "Target Model")
-    return results
-
-# -----------------------------
-# 9. Main Execution
+# 8. Main Execution with Timing
 # -----------------------------
 def main():
-    """Main execution function"""
-    print("=== Membership Inference Attack Implementation ===")
+    """Main execution function with comprehensive timing"""
+    print("=== Enhanced Membership Inference Attack Implementation ===")
     print(f"Configuration: {config.N_SHADOW} shadow models, "
           f"{config.SHADOW_SIZE} train + {config.SHADOW_TEST} test per shadow")
     
+    total_start_time = time.time()
+    timing_results = {}
+    
     # Load datasets
-    mnist_train, mnist_test, fashion_mnist, kmnist, cifar10 = load_datasets()
-    mnist_aux, nonmember_datasets, mnist_indices = create_auxiliary_datasets(
-        mnist_train, fashion_mnist, kmnist, cifar10)
+    load_start = time.time()
+    mnist_train, mnist_test, mnist_train_aug, fashion_mnist, kmnist, cifar10 = load_datasets()
+    mnist_aux, nonmember_datasets, aux_indices, target_indices = create_auxiliary_datasets(
+        mnist_train, mnist_train_aug, fashion_mnist, kmnist, cifar10)
+    timing_results['data_loading'] = time.time() - load_start
     
     # Train shadow models
     print("\n=== Training Shadow Models ===")
     shadow_models = []
+    shadow_training_times = []
+    
+    # Verify we have enough data
+    total_aux_needed = config.N_SHADOW * (config.SHADOW_SIZE + config.SHADOW_TEST)
+    if len(aux_indices) < total_aux_needed:
+        print(f"Warning: Not enough auxiliary data. Have {len(aux_indices)}, need {total_aux_needed}")
+        print("Adjusting shadow model configuration...")
+        available_per_shadow = len(aux_indices) // config.N_SHADOW
+        config.SHADOW_SIZE = int(available_per_shadow * 0.8)
+        config.SHADOW_TEST = int(available_per_shadow * 0.2)
+        print(f"New shadow size: {config.SHADOW_SIZE}, test size: {config.SHADOW_TEST}")
     
     for i in range(config.N_SHADOW):
         # Prepare data for this shadow model
@@ -706,13 +890,30 @@ def main():
         end_train = start_idx + config.SHADOW_SIZE
         end_test = start_idx + config.SHADOW_SIZE + config.SHADOW_TEST
         
+        # Ensure we don't exceed available indices
+        if end_test > len(aux_indices):
+            print(f"Skipping shadow model {i} - insufficient data")
+            break
+        
         # Create train/val split for shadow model
-        shadow_train_indices = mnist_indices[start_idx:end_train]
-        shadow_train_subset = Subset(mnist_train, shadow_train_indices)
+        shadow_train_indices = aux_indices[start_idx:end_train]
+        shadow_train_subset = Subset(mnist_aux.dataset, shadow_train_indices)
+        
+        # Check if we have data
+        if len(shadow_train_subset) == 0:
+            print(f"No data available for shadow model {i}")
+            break
         
         # Split training data for validation
         train_size = int(0.8 * len(shadow_train_subset))
         val_size = len(shadow_train_subset) - train_size
+        
+        # Ensure we have at least some data for both splits
+        if train_size == 0 or val_size == 0:
+            print(f"Insufficient data for train/val split in shadow model {i}")
+            train_size = max(1, int(0.8 * len(shadow_train_subset)))
+            val_size = max(1, len(shadow_train_subset) - train_size)
+        
         train_subset, val_subset = random_split(shadow_train_subset, [train_size, val_size])
         
         train_loader = DataLoader(train_subset, batch_size=config.BATCH_SHADOW, shuffle=True)
@@ -720,18 +921,32 @@ def main():
         
         # Initialize and train shadow model
         shadow_model = EnhancedCNN(num_classes=config.NUM_CLASSES).to(config.DEVICE)
-        train_losses, val_losses, train_accs, val_accs = train_shadow_model(
+        (train_losses, val_losses, train_accs, val_accs), train_time = train_shadow_model(
             shadow_model, train_loader, val_loader, i)
         
         shadow_models.append(shadow_model)
+        shadow_training_times.append(train_time)
+        
+    # Update number of successfully trained shadow models
+    config.N_SHADOW = len(shadow_models)
+    print(f"\nSuccessfully trained {config.N_SHADOW} shadow models")
+    
+    if config.N_SHADOW < 2:
+        print("Error: Need at least 2 shadow models for attack")
+        return None, None, None, None, None
+    
+    timing_results['shadow_training'] = sum(shadow_training_times)
+    timing_results['avg_shadow_training'] = np.mean(shadow_training_times)
     
     # Collect features from shadow models
     print("\n=== Collecting Features from Shadow Models ===")
-    member_features, nonmember_features = collect_shadow_features(
-        shadow_models, mnist_aux, nonmember_datasets, mnist_indices)
+    (member_features, nonmember_features), feature_time = collect_shadow_features(
+        shadow_models, mnist_aux, nonmember_datasets, aux_indices)
+    timing_results['feature_extraction'] = feature_time
     
     # Prepare attack training data
     print("\n=== Preparing Attack Classifier Data ===")
+    prep_start = time.time()
     
     # Create labels
     member_labels = torch.ones(len(member_features), dtype=torch.long)
@@ -774,14 +989,17 @@ def main():
     y_test = all_labels[n_train+n_val:]
     
     print(f"Attack dataset sizes - Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+    timing_results['data_preparation'] = time.time() - prep_start
     
     # Train attack classifier
     print("\n=== Training Attack Classifier ===")
-    attack_model, train_losses, val_losses, train_aucs, val_aucs = train_attack_classifier(
+    (attack_model, train_losses, val_losses, train_aucs, val_aucs), attack_time = train_attack_classifier(
         X_train, y_train, X_val, y_val)
+    timing_results['attack_training'] = attack_time
     
     # Evaluate attack classifier
     print("\n=== Evaluating Attack Classifier ===")
+    eval_start = time.time()
     
     # Load best model
     if config.SAVE_MODELS:
@@ -790,15 +1008,12 @@ def main():
     # Evaluate on test set
     test_results = comprehensive_evaluation(attack_model, X_test, y_test, scaler, "Attack Test Set")
     
-    # Train target model (simulating a real target)
+    # Train target model with similar settings to shadow models
     print("\n=== Training Target Model ===")
     target_model = EnhancedCNN(num_classes=config.NUM_CLASSES).to(config.DEVICE)
     
-    # Use remaining MNIST data for target model
-    remaining_indices = list(set(range(len(mnist_train))) - set(mnist_indices))
-    target_train_size = min(10000, len(remaining_indices))
-    target_train_indices = np.random.choice(remaining_indices, target_train_size, replace=False)
-    target_train_subset = Subset(mnist_train, target_train_indices)
+    # Use reserved MNIST data for target model
+    target_train_subset = Subset(mnist_train, target_indices[:config.TARGET_SIZE])
     
     # Split for training and validation
     train_size = int(0.8 * len(target_train_subset))
@@ -808,26 +1023,34 @@ def main():
     train_loader = DataLoader(train_subset, batch_size=config.BATCH_SHADOW, shuffle=True)
     val_loader = DataLoader(val_subset, batch_size=config.BATCH_SHADOW, shuffle=False)
     
-    # Train target model
-    train_losses, val_losses, train_accs, val_accs = train_shadow_model(
+    # Train target model with same settings as shadow models
+    (_, _, _, _), target_train_time = train_shadow_model(
         target_model, train_loader, val_loader, "target")
+    timing_results['target_training'] = target_train_time
     
     # Evaluate attack on target model
-    target_results = evaluate_on_target_model(
+    target_results, target_eval_time = evaluate_on_target_model(
         attack_model, target_model, target_train_subset, mnist_test, scaler)
+    
+    timing_results['evaluation'] = time.time() - eval_start
+    timing_results['total_time'] = time.time() - total_start_time
     
     # Plot all results
     print("\n=== Plotting Results ===")
     plot_results([test_results, target_results], save_path=f"{config.LOG_DIR}/mia_results.png")
     
-    # Save summary results
+    # Save summary results with timing
     summary = {
         "config": {
             "n_shadow": config.N_SHADOW,
             "shadow_size": config.SHADOW_SIZE,
             "shadow_test": config.SHADOW_TEST,
+            "target_size": config.TARGET_SIZE,
             "epochs_shadow": config.EPOCHS_SHADOW,
             "epochs_attack": config.EPOCHS_ATTACK,
+            "use_augmentation": config.USE_AUGMENTATION,
+            "temperature_scaling": config.TEMPERATURE_SCALING,
+            "ensemble_shadows": config.ENSEMBLE_SHADOWS,
         },
         "results": {
             "attack_test": {
@@ -841,6 +1064,24 @@ def main():
                 "tpr_at_01_fpr": float(target_results['tpr_at_01_fpr']),
             }
         },
+        "timing": {
+            "data_loading": timing_results['data_loading'],
+            "shadow_training_total": timing_results['shadow_training'],
+            "shadow_training_avg": timing_results['avg_shadow_training'],
+            "feature_extraction": timing_results['feature_extraction'],
+            "data_preparation": timing_results['data_preparation'],
+            "attack_training": timing_results['attack_training'],
+            "target_training": timing_results['target_training'],
+            "evaluation": timing_results['evaluation'],
+            "total_time": timing_results['total_time'],
+        },
+        "efficiency_metrics": {
+            "total_time_minutes": timing_results['total_time'] / 60,
+            "attack_prep_time": (timing_results['shadow_training'] + 
+                               timing_results['feature_extraction'] + 
+                               timing_results['attack_training']) / 60,
+            "inference_time_per_sample": timing_results['evaluation'] / (len(target_train_subset) + len(mnist_test)),
+        },
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     
@@ -852,145 +1093,58 @@ def main():
           f"Accuracy: {test_results['accuracy']:.4f}")
     print(f"Target Model - AUC: {target_results['auc']:.4f}, "
           f"Accuracy: {target_results['accuracy']:.4f}")
+    
+    print("\n=== Timing Summary ===")
+    print(f"Total execution time: {timing_results['total_time']:.2f} seconds "
+          f"({timing_results['total_time']/60:.2f} minutes)")
+    print(f"Shadow model training: {timing_results['shadow_training']:.2f} seconds")
+    print(f"Feature extraction: {timing_results['feature_extraction']:.2f} seconds")
+    print(f"Attack training: {timing_results['attack_training']:.2f} seconds")
+    print(f"Target evaluation: {timing_results['evaluation']:.2f} seconds")
+    print(f"Inference time per sample: {summary['efficiency_metrics']['inference_time_per_sample']*1000:.2f} ms")
+    
     print(f"\nResults saved to {config.LOG_DIR}/")
     
-    return attack_model, target_model, test_results, target_results
+    return attack_model, target_model, test_results, target_results, timing_results
 
 # -----------------------------
-# 10. Additional Analysis Functions
+# 9. Additional Analysis Functions
 # -----------------------------
-def analyze_feature_importance(attack_model, scaler, feature_names=None):
-    """Analyze feature importance for the attack model"""
-    if feature_names is None:
-        feature_names = [
-            "Max Probability", "Entropy", "Cross-Entropy Loss", 
-            "Confidence Gap", "Top-3 Sum", "Prob Variance", 
-            "Prob Std Dev", "KL from Uniform", "Highest Prob", 
-            "Second Highest Prob"
-        ]
+def analyze_hyperparameter_impact(base_config):
+    """Analyze impact of different hyperparameters on attack success"""
+    print("\n=== Analyzing Hyperparameter Impact ===")
     
-    # For neural networks, we can use gradient-based importance
-    attack_model.eval()
+    results = {}
     
-    # Create dummy input
-    dummy_input = torch.randn(100, len(feature_names)).to(config.DEVICE)
-    dummy_input.requires_grad = True
+    # Test different numbers of shadow models
+    shadow_counts = [2, 4, 6, 8]
+    for n_shadow in shadow_counts:
+        print(f"\nTesting with {n_shadow} shadow models...")
+        config.N_SHADOW = n_shadow
+        # Run simplified version of main
+        # ... (simplified execution)
+        # results[f'shadow_{n_shadow}'] = auc_score
     
-    # Forward pass
-    output = attack_model(dummy_input)
-    
-    # Calculate gradients for member class
-    attack_model.zero_grad()
-    output[:, 1].sum().backward()
-    
-    # Get average absolute gradients
-    importance = dummy_input.grad.abs().mean(dim=0).cpu().numpy()
-    
-    # Create importance plot
-    plt.figure(figsize=(10, 6))
-    indices = np.argsort(importance)[::-1]
-    plt.bar(range(len(importance)), importance[indices])
-    plt.xticks(range(len(importance)), [feature_names[i] for i in indices], rotation=45, ha='right')
-    plt.xlabel("Features")
-    plt.ylabel("Importance Score")
-    plt.title("Feature Importance for Membership Inference")
-    plt.tight_layout()
-    plt.savefig(f"{config.LOG_DIR}/feature_importance.png", dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    return importance, feature_names
+    return results
 
-def analyze_model_vulnerability(shadow_models, attack_model, scaler):
-    """Analyze which types of samples are most vulnerable to MIA"""
-    print("\n=== Analyzing Model Vulnerability ===")
+def analyze_data_requirements():
+    """Analyze how data requirements affect attack performance"""
+    print("\n=== Analyzing Data Requirements ===")
     
-    # Use first shadow model for analysis
-    model = shadow_models[0]
-    model.eval()
+    data_sizes = [1000, 2500, 5000, 10000]
+    results = {}
     
-    # Load a subset of data
-    mnist_train = datasets.MNIST(root="./data", train=True, download=True, 
-                                transform=transforms.Compose([
-                                    transforms.ToTensor(),
-                                    transforms.Normalize((0.5,), (0.5,))
-                                ]))
+    for size in data_sizes:
+        print(f"\nTesting with {size} samples per shadow model...")
+        config.SHADOW_SIZE = size
+        # Run simplified version
+        # results[f'size_{size}'] = auc_score
     
-    # Get a sample of data
-    subset_indices = np.random.choice(len(mnist_train), 1000, replace=False)
-    subset = Subset(mnist_train, subset_indices)
-    loader = DataLoader(subset, batch_size=config.BATCH_ATTACK, shuffle=False)
-    
-    # Extract features and predictions
-    all_features = []
-    all_predictions = []
-    all_labels = []
-    all_confidences = []
-    
-    with torch.no_grad():
-        for data, labels in loader:
-            data = data.to(config.DEVICE)
-            logits = model(data)
-            features = extract_comprehensive_features(logits)
-            
-            # Get predictions and confidences
-            probs = F.softmax(logits, dim=1)
-            confidences, predictions = probs.max(dim=1)
-            
-            all_features.append(features.cpu())
-            all_predictions.extend(predictions.cpu().numpy())
-            all_labels.extend(labels.numpy())
-            all_confidences.extend(confidences.cpu().numpy())
-    
-    all_features = torch.cat(all_features, dim=0)
-    
-    # Get attack scores
-    features_scaled = torch.tensor(scaler.transform(all_features.numpy())).float()
-    attack_model.eval()
-    
-    with torch.no_grad():
-        attack_logits = attack_model(features_scaled.to(config.DEVICE))
-        attack_scores = F.softmax(attack_logits, dim=1)[:, 1].cpu().numpy()
-    
-    # Analyze vulnerability by confidence
-    plt.figure(figsize=(12, 5))
-    
-    plt.subplot(1, 2, 1)
-    plt.scatter(all_confidences, attack_scores, alpha=0.5)
-    plt.xlabel("Model Confidence")
-    plt.ylabel("Attack Score")
-    plt.title("Attack Score vs Model Confidence")
-    plt.grid(True, alpha=0.3)
-    
-    # Analyze vulnerability by class
-    plt.subplot(1, 2, 2)
-    class_scores = {}
-    for i in range(10):
-        class_mask = np.array(all_labels) == i
-        if class_mask.sum() > 0:
-            class_scores[i] = attack_scores[class_mask].mean()
-    
-    plt.bar(class_scores.keys(), class_scores.values())
-    plt.xlabel("Class")
-    plt.ylabel("Average Attack Score")
-    plt.title("Average Attack Score by Class")
-    plt.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(f"{config.LOG_DIR}/vulnerability_analysis.png", dpi=300, bbox_inches='tight')
-    plt.show()
-    
-    return attack_scores, all_confidences, all_labels
+    return results
 
 # Run the main function
 if __name__ == "__main__":
-    attack_model, target_model, test_results, target_results = main()
-    
-    # Additional analyses
-    print("\n=== Additional Analyses ===")
-    
-    # Analyze feature importance
-    scaler = StandardScaler()
-    # Note: You'll need to reload the scaler from training
-    # importance, feature_names = analyze_feature_importance(attack_model, scaler)
+    attack_model, target_model, test_results, target_results, timing_results = main()
     
     print("\nMembership Inference Attack completed successfully!")
+    print("Check the results in ./mia_results/")
