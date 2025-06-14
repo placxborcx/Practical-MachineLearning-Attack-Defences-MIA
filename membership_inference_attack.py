@@ -48,7 +48,7 @@ class Config:
     SHADOW_TEST = 1000     # More test data for better non-member representation
     
     # Target model configuration
-    TARGET_SIZE = 2000     # Match shadow model size 2000
+    TARGET_SIZE = 800     # Match shadow model size 2000
     TARGET_EPOCHS = 80     # Much more epochs for strong overfitting
     
     # Non-member dataset sizes - increased
