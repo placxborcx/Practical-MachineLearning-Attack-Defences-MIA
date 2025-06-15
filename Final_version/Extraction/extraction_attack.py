@@ -338,18 +338,11 @@ def train_surrogate(ds: TensorDataset) -> nn.Module:
 """
 Functionality:
 After training, the surrogate model is evaluated on MNIST test data. Metrics include:
-
 Accuracy of the victim model
-
 Accuracy of the surrogate model
-
 Agreement rate (how often both models make the same prediction)
-
 These metrics measure the success of the model extraction attack.
-
 """
-
-
 
 @torch.no_grad()
 def evaluate(v: nn.Module, s: nn.Module) -> Dict[str,float]:
@@ -389,14 +382,11 @@ def main() -> None:
     
     # 1  Victim preparation (train or load)
     t=time.perf_counter(); vict=load_victim(); TIMES["victim_prepare_s"]=time.perf_counter()-t
-
     # 2  Query-set generation
     api=BlackBoxAPI(vict)
     t=time.perf_counter(); qset=build_query_set(api, int(CFG["n_queries"])); TIMES["query_phase_s"]=time.perf_counter()-t
-
     # 3  Surrogate training
     t=time.perf_counter(); surro=train_surrogate(qset); TIMES["surrogate_train_s"]=time.perf_counter()-t
-
     # 4  Evaluation
     t=time.perf_counter(); res=evaluate(vict,surro); TIMES["evaluation_s"]=time.perf_counter()-t
     TIMES["total_runtime_s"]=time.perf_counter()-T0_GLOBAL
