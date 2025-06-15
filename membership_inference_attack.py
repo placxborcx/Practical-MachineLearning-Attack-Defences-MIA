@@ -39,7 +39,7 @@ class Config:
     BATCH_ATTACK = 256
     EPOCHS_SHADOW = 50     # Much more epochs for overfitting
     EPOCHS_ATTACK = 60     # More epochs for attack model
-    N_SHADOW = 8           # More shadow models
+    N_SHADOW = 8           # More shadow models 
     NUM_CLASSES = 10
     SEED = 1337
     
