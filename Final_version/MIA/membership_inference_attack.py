@@ -23,9 +23,6 @@ against machine learning models, particularly those trained on image classificat
 tasks. The attack leverages confidence patterns to distinguish between training
 data (members) and unseen data (non-members).
 
-Author: [Your Name]
-Date: [Current Date]
-Course: [Course Information]
 """
 
 import torch
