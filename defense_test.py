@@ -64,3 +64,14 @@ scaler = StandardScaler().fit(X)  #Attack viewpoint：re-calculate scaler
 X_scaled = torch.tensor(scaler.transform(X)).float()
 res = evaluate_attack(attack, X_scaled, y, scaler, title="Defended Target", already_scaled=True)
 print("\n★ After defence, AUC = {:.4f}".format(res["auc"]))
+
+
+
+def statistical_denoising_attack(model, input_data, num_queries=50):
+    outputs = []
+    for _ in range(num_queries):
+        output = model(input_data)  # Multi-input insert at once
+        outputs.append(output)
+    
+    # My noise setting is independent Gaussian noise, the attacker can remove the noise by averaging
+    estimated_clean_output = torch.stack(outputs).mean(dim=0)
